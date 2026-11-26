@@ -6,6 +6,11 @@ selects) for make.fun's "One Line to Your Younger Self" bounty.
 The line is a fixed, original sentence written for this entry. The
 program takes no input, reads no file, and makes no network call: it
 only writes the line, then reads it back and validates it.
+
+If the first output location cannot be written or fails read-back
+validation, the program falls through to the next candidate location
+instead of failing outright, and only exits non-zero when no candidate
+location produces a verified file.
 """
 
 import os
@@ -16,56 +21,89 @@ LINE = "Stop saving the good shoes for someday, kid \u2014 someday is a Tuesday 
 MAX_CHARS = 200
 
 
-def resolve_output_path() -> str:
-    """Pick the output path: ENTRY_OUTPUT wins, then a directory env var."""
+def candidate_paths() -> list:
+    """Output locations in priority order.
+
+    ENTRY_OUTPUT wins; then a directory env var; then the default.
+    """
+    paths = []
     direct = os.environ.get("ENTRY_OUTPUT")
     if direct:
-        return direct
+        paths.append(direct)
     for var in ("OUTPUT_DIR", "MAKEFUN_OUTPUT_DIR"):
         directory = os.environ.get(var)
         if directory:
-            return os.path.join(directory, "entry.txt")
-    return "/output/entry.txt"
+            paths.append(os.path.join(directory, "entry.txt"))
+    paths.append("/output/entry.txt")
+    return paths
 
 
-def main() -> int:
-    text = LINE
+def check_line(text: str) -> str | None:
+    """Return an error message if the line breaks a gate, else None."""
     if not (1 <= len(text) <= MAX_CHARS):
-        print(f"gate failed: line is {len(text)} chars, must be 1-200",
-              file=sys.stderr)
-        return 1
+        return f"line is {len(text)} chars, must be 1-200"
     if not text.strip():
-        print("gate failed: line is whitespace only", file=sys.stderr)
-        return 1
+        return "line is whitespace only"
     if "\n" in text or "\r" in text:
-        print("gate failed: line must be a single line", file=sys.stderr)
-        return 1
-    if any(ord(ch) < 0x20 and ch not in ("\t",) for ch in text):
-        print("gate failed: control characters in line", file=sys.stderr)
-        return 1
+        return "line must be a single line"
+    if any(ord(ch) < 0x20 and ch != "\t" for ch in text):
+        return "control characters in line"
+    return None
 
-    path = resolve_output_path()
+
+def write_and_verify(path: str, text: str, data: bytes) -> None:
+    """Write the line to path, then prove the file holds exactly it.
+
+    Raises OSError / ValueError on any failure so the caller can try
+    the next candidate location.
+    """
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    data = text.encode("utf-8")
     with open(path, "wb") as handle:
         handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
     os.chmod(path, 0o644)
+    if os.stat(path).st_mode & 0o777 != 0o644:
+        raise ValueError("file mode is not 0644 after chmod")
 
     with open(path, "rb") as handle:
         written = handle.read()
     if written != data:
-        print("validation failed: file bytes differ from the line",
-              file=sys.stderr)
-        return 1
+        raise ValueError("file bytes differ from the line")
     decoded = written.decode("utf-8")
-    if decoded != text or "\n" in decoded or "\r" in decoded:
-        print("validation failed: file text differs from the line",
-              file=sys.stderr)
+    if decoded != text:
+        raise ValueError("file text differs from the line")
+    if "\n" in decoded or "\r" in decoded:
+        raise ValueError("written file is not a single line")
+    if any(ord(ch) < 0x20 and ch != "\t" for ch in decoded):
+        raise ValueError("control characters in written file")
+
+
+def main() -> int:
+    text = LINE
+    problem = check_line(text)
+    if problem is not None:
+        print(f"gate failed: {problem}", file=sys.stderr)
         return 1
-    print(f"wrote {len(text)} chars ({len(data)} bytes) to {path}")
-    return 0
+
+    data = text.encode("utf-8")
+    errors = []
+    for path in candidate_paths():
+        try:
+            write_and_verify(path, text, data)
+        except (OSError, ValueError) as exc:
+            errors.append(f"{path}: {exc}")
+            continue
+        print(f"wrote {len(text)} chars ({len(data)} bytes) to {path}")
+        return 0
+
+    for error in errors:
+        print(f"write failed: {error}", file=sys.stderr)
+    print("validation failed: no output location produced a verified file",
+          file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
